@@ -1,14 +1,118 @@
 defmodule StreamRouter do
   @moduledoc """
-  The `StreamRunner` provides a convenient way to run a `Stream` as process in a
-  supervisor tree.
+  The `StreamRouter` provides a convenient way to run a stream as a process routing
+  the items enumerated by the stream to other processes along the way.
 
-  To run a `Stream` as a process simply pass the stream to `StreamRunner.start_link/1`:
+  Whereas StreamRunner iterates through the stream as fast as the stream source
+  will permit, StreamRouter only iterates through an item when asked.
 
-      stream = Stream.interval(1_000) |> Stream.each(&IO.inspect/1)
-      {:ok, pid} = StreamRunner.start_link(stream)
+  ## Example
 
+  We're going to build a stream of random numbers, and route those into a
+  gen server that will manage 5 timers set according to the numbers.
+
+  Here's our stream:
+
+      stream = fn -> :random.uniform(10) * 1000 end
+      |> Stream.repeatedly
+      |> Stream.each(&TimerServer.add_timer(TimerServer.pid, &1))
+
+      {:ok, pid} = StreamRouter.start_link(stream)
+
+  And our GenServer
+
+      defmodule TimerServer do
+        @desired_timers 5
+
+        def pid, do: Process.whereis(__MODULE__)
+
+        def add_timer(pid, value) do
+          GenServer.call(pid, {:add_timer, value})
+        end
+
+        def init(stream_pid) do
+          StreamRouter.ask(stream_pid, @desired_timers)
+          {:ok, stream_pid}
+        end
+
+        def handle_call({:add_timer, value}, _from, stream_pid) do
+          Process.send_after(self(), :ding, value)
+          {:reply, timer, stream_pid}
+        end
+
+        def handle_info(:ding, stream_pid) do
+          StreamRouter.ask(stream_pid, 1)
+          {:noreply, stream_pid}
+        end
+      end
+
+    Obviously this doesn't really do anything.
   """
+
+  ## StreamRouter API
+  ###################
+
+  @doc """
+  Route an event to a sink
+  """
+  @spec route(pid, term, timeout) :: :ok | {:error, term}
+  def route(sink, event, timeout \\ 5000) do
+    ref = Process.monitor(sink)
+    send(sink, {:"$gen_route", {self(), ref}, event})
+    wait_for_reply(:route, ref, sink, event, timeout)
+  end
+
+  @typedoc "`eos/2,3` possible reasons"
+  @type eos_reason :: :done | :halted | {:error, term}
+
+  @doc """
+  Indicate demand for items
+  """
+  @spec ask(pid, integer, timeout) :: :ok | {:error, term}
+  def ask(source, quantity, timeout \\ 5000) do
+    ref = Process.monitor(source)
+    send(source, {:"$gen_ask", {self(), ref}, {quantity, []}})
+    wait_for_reply(:ask, ref, source, quantity, timeout)
+  end
+
+  @doc """
+  Notify a sink that the stream is terminating
+  """
+  @spec ask_async(pid, integer) :: :ok
+  def ask_async(source, quantity) do
+    send(source, {:"$gen_ask", {self(), nil}, {quantity, []}})
+    :ok
+  end
+
+  @doc """
+  Notify a sink that the stream is terminating
+  """
+  @spec eos(pid, eos_reason) :: :ok | {:error, term}
+  def eos(sink, reason, timeout \\ 5000) do
+    ref = Process.monitor(sink)
+    send(sink, {:"$gen_route", {self(), ref}, {:eos, reason}})
+    wait_for_reply(:eos, ref, sink, reason, timeout)
+  end
+
+  defp wait_for_reply(fun, ref, sink, event, timeout) do
+    receive do
+      {^ref, reply} ->
+        Process.demonitor(ref, [:flush])
+        reply
+      {:DOWN, ^ref, _, _, :noconnection} ->
+        mfa = {__MODULE__, :route, [sink, event, timeout]}
+        exit({{:nodedown, node(sink)}, mfa})
+      {:DOWN, ^ref, _, _, reason} ->
+        exit({reason, {__MODULE__, fun, [sink, event, timeout]}})
+    after
+      timeout ->
+        Process.demonitor(ref, [:flush])
+        exit({:timeout, {__MODULE__, fun, [sink, event, timeout]}})
+    end
+  end
+
+  ## Starting StreamRouter
+  ########################
 
   @typedoc "Debug option values."
   @type debug_option :: :trace | :log | :statistics | {:log_to_file, Path.t}
@@ -30,8 +134,8 @@ defmodule StreamRouter do
   Start a `StreamRunner` as part of the supervision tree.
   """
   @spec start_link(Enumerable.t, [option]) :: on_start
-  def start_link(stream, dest, opts \\ []) do
-    start(stream, dest, opts, :link)
+  def start_link(stream, opts \\ []) do
+    start(stream, opts, :link)
   end
 
   @doc """
@@ -39,8 +143,8 @@ defmodule StreamRouter do
 
   The `StreamRunner` is not linked to the calling process.
   """
-  def start(stream, dest, opts \\ []) do
-    start(stream, dest, opts, :nolink)
+  def start(stream, opts \\ []) do
+    start(stream, opts, :nolink)
   end
 
   ## :gen callbacks
@@ -49,7 +153,7 @@ defmodule StreamRouter do
   def init_it(starter, :self, name, mod, args, opts) do
     init_it(starter, self(), name, mod, args, opts)
   end
-  def init_it(starter, parent, name, __MODULE__, {stream, dest}, opts) do
+  def init_it(starter, parent, name, __MODULE__, stream, opts) do
     _ = Process.put(:"$initial_call", {StreamRunner, :init_it, 6})
     dbg = :gen.debug_options(opts)
     try do
@@ -68,7 +172,7 @@ defmodule StreamRouter do
         init_stop(:ignore, :normal, starter, name)
       {:suspended, nil, cont} ->
         :proc_lib.init_ack(starter, {:ok, self()})
-        enter_loop(parent, dbg, name, cont, dest)
+        enter_loop(parent, dbg, name, cont)
       other ->
         reason = {:bad_return_value, other}
         init_error(reason, starter, name)
@@ -114,16 +218,16 @@ defmodule StreamRouter do
 
   ## Internal
 
-  defp start(stream, dest, opts, link) do
+  defp start(stream, opts, link) do
     case Keyword.pop(opts, :name) do
       {nil, opts} ->
-        :gen.start(__MODULE__, link, __MODULE__, {stream, dest}, opts)
+        :gen.start(__MODULE__, link, __MODULE__, stream, opts)
       {atom, opts} when is_atom(atom) ->
-        :gen.start(__MODULE__, link, {:local, atom}, __MODULE__, {stream, dest}, opts)
+        :gen.start(__MODULE__, link, {:local, atom}, __MODULE__, stream, opts)
       {{:global, _} = name, opts} ->
-        :gen.start(__MODULE__, link, name, __MODULE__, {stream, dest}, opts)
+        :gen.start(__MODULE__, link, name, __MODULE__, stream, opts)
       {{:via, _, _} = name, opts} ->
-        :gen.start(__MODULE__, link, name, __MODULE__, {stream, dest}, opts)
+        :gen.start(__MODULE__, link, name, __MODULE__, stream, opts)
     end
   end
 
@@ -142,36 +246,82 @@ defmodule StreamRouter do
   defp unregister({:global, name}), do: :global.unregister_name(name)
   defp unregister({:via, mod, name}), do: apply(mod, :unregister_name, [name])
 
-  defp enter_loop(parent, dbg, {:local, name}, cont, dest) do
-    loop(parent, dbg, name, cont, dest, 0)
+  defp enter_loop(parent, dbg, {:local, name}, cont) do
+    loop(parent, dbg, name, cont, %{}, 0)
   end
-  defp enter_loop(parent, dbg, name, cont, dest) do
-    loop(parent, dbg, name, cont, dest, 0)
+  defp enter_loop(parent, dbg, name, cont) do
+    loop(parent, dbg, name, cont, %{}, 0)
   end
 
-  # If there's no demand, simply wait for a message
-  defp loop(parent, dbg, name, cont, dest, 0 = demand) do
+  # TODO: store demand in an ordered structure
+  # Most of the time we're just concerned with the minimum demand anyway
+  def handle_demand(sinks, pid, :cancel) do
+    sinks = case Map.fetch(pid) do
+      {:ok, _} ->
+        Process.demonitor(pid, [:flush])
+        Map.delete(sinks, pid)
+      :error -> sinks
+    end
+    {sinks, determine_demand(sinks)}
+  end
+
+  def handle_demand(sinks, pid, count) do
+    _ = Process.monitor(pid)
+    sinks = Map.put(sinks, pid, count)
+    {sinks, determine_demand(sinks)}
+  end
+
+  def supply_demand(sinks, count) do
+    sinks = sinks |> Enum.into(%{}, fn {k, v} -> {k, v - count} end)
+    {sinks, determine_demand(sinks)}
+  end
+
+  def determine_demand(sinks) do
+    {_, demand} = Enum.min_by(sinks, &elem(&1, 1))
+    demand
+  end
+
+  # Handle debug messages every loop
+  defp loop(parent, dbg, name, cont, sinks, ag_demand) do
     receive do
       {:EXIT, ^parent, reason} ->
         terminate(reason, dbg, name, cont)
       {:system, from, msg} ->
-        :sys.handle_system_msg(msg, from, parent, __MODULE__, dbg, [name, cont, dest, demand])
-      {:"$gen_ask", {^dest, _}, {count, _}} ->
-        loop(parent, dbg, name, cont, dest, count)
+        :sys.handle_system_msg(msg, from, parent, __MODULE__, dbg, [name, cont, sinks, ag_demand])
+    after
+      0 -> handle_router_msgs(parent, dbg, name, cont, sinks, ag_demand)
     end
   end
 
-  # Even if there is demand we want to check the inbox
-  # on each iteration to ensure that it is cleared as often
-  # as necessary.
-  defp loop(parent, dbg, name, cont, dest, demand) do
+  # If nothing has asked for events yet, wait until something does.
+  # StreamRouter is only designed to listen to have one destination at this time.
+  defp handle_router_msgs(parent, dbg, name, cont, sinks, 0) do
     receive do
-      {:EXIT, ^parent, reason} ->
-        terminate(reason, dbg, name, cont)
-      {:system, from, msg} ->
-        :sys.handle_system_msg(msg, from, parent, __MODULE__, dbg, [name, cont, dest, demand])
-      {:"$gen_ask", {^dest, _}, {count, _}} ->
-        loop(parent, dbg, name, cont, dest, demand + count)
+      {:EXIT, pid, _} ->
+        {sinks, ag_demand} = handle_demand(sinks, pid, :cancel)
+        loop(parent, dbg, name, cont, sinks, ag_demand)
+      {:"$gen_ask", {pid, nil}, {count, _}} ->
+        {sinks, ag_demand} = handle_demand(sinks, pid, count)
+        loop(parent, dbg, name, cont, sinks, ag_demand)
+      {:"$gen_ask", {pid, ref}, {count, _}} ->
+        {sinks, ag_demand} = handle_demand(sinks, pid, count)
+        send(pid, {ref, :ok})
+        loop(parent, dbg, name, cont, sinks, ag_demand)
+    end
+  end
+
+  defp handle_router_msgs(parent, dbg, name, cont, sinks, ag_demand) do
+    receive do
+      {:EXIT, pid, _} ->
+        {sinks, ag_demand} = handle_demand(sinks, pid, :cancel)
+        loop(parent, dbg, name, cont, sinks, ag_demand)
+      {:"$gen_ask", {pid, nil}, {count, _}} ->
+        {sinks, ag_demand} = handle_demand(sinks, pid, count)
+        loop(parent, dbg, name, cont, sinks, ag_demand)
+      {:"$gen_ask", {pid, ref}, {count, _}} ->
+        {sinks, ag_demand} = handle_demand(sinks, pid, count)
+        send(pid, {ref, :ok})
+        loop(parent, dbg, name, cont, sinks, ag_demand)
     after
       0 ->
         try do
@@ -186,15 +336,14 @@ defmodule StreamRouter do
           :exit, value ->
             log_stop({value, System.stacktrace()}, value, dbg, name, cont)
         else
-          {:suspended, val, cont} when dbg == [] ->
-            send(dest, {:"$gen_route", {dest, nil}, [val]})
-            loop(parent, dbg, name, cont, dest, demand - 1)
-          {:suspended, val, cont} = event ->
+          {:suspended, _, cont} when dbg == [] ->
+            {sinks, ag_demand} = supply_demand(sinks, 1)
+            loop(parent, dbg, name, cont, sinks, ag_demand)
+          {:suspended, _, cont} = event ->
             dbg = :sys.handle_debug(dbg, &print_event/3, name, event)
-            send(dest, {:"$gen_route", {dest, nil}, [val]})
-            loop(parent, dbg, name, cont, dest, demand - 1)
+            {sinks, ag_demand} = supply_demand(sinks, 1)
+            loop(parent, dbg, name, cont, sinks, ag_demand)
           {res, nil} when res in [:halted, :done] ->
-            send(dest, {:"$gen_route", {dest, nil}, {:eos, res}})
             exit(:normal)
           other ->
             reason = {:bad_return_value, other}
@@ -230,7 +379,7 @@ defmodule StreamRouter do
     end
   end
 
-  defp stop(:normal, _, _, _),                  do: exit(:normal)
+  defp stop(:normal, _, _, _),                   do: exit(:normal)
   defp stop(:shutdown, _, _, _),                 do: exit(:shutdown)
   defp stop({:shutdown, _} = shutdown, _, _, _), do: exit(shutdown)
   defp stop(reason, dbg, name, cont),            do: log_stop(reason, reason, dbg, name, cont)

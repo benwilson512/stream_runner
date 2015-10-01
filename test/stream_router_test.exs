@@ -8,14 +8,22 @@ defmodule StreamRouterTest do
 
   test "start_link/1" do
     self = self()
-    {:ok, pid} = StreamRouter.start_link(1..10, self)
-    assert pid |> Process.alive?
+    {:ok, pid} = 1..10
+    |> Stream.each(&send(self, &1))
+    |> StreamRouter.start_link()
 
-    pid |> send({:"$gen_ask", {self(), :foo}, {1, []}})
-    assert_receive {:"$gen_route", {^self, nil}, [1]}
+    pid
+    |> StreamRouter.ask_async(1)
+    assert_receive 1
 
-    pid |> send({:"$gen_ask", {self(), :foo}, {2, []}})
-    assert_receive {:"$gen_route", {^self, nil}, [2]}
-    assert_receive {:"$gen_route", {^self, nil}, [3]}
+    pid
+    |> StreamRouter.ask_async(1)
+    assert_receive 2
+
+    pid
+    |> StreamRouter.ask(2)
+
+    assert_receive 3
+    assert_receive 4
   end
 end
