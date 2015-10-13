@@ -65,7 +65,9 @@ defmodule StreamRouter do
 
       defimpl Collectable do
         def into(%{pid: pid} = dest) do
-          send(pid, {:stream_up, self()})
+          pid
+          |> resolve
+          |> send({:stream_up, self()})
           {dest, &do_into/2}
         end
 
@@ -77,6 +79,9 @@ defmodule StreamRouter do
           StreamRouter.eos(pid, done_or_halt)
           dest
         end
+
+        defp resolve(pid) when is_pid(pid), do: pid
+        defp resolve(pid), do: Process.whereis(pid)
       end
     end
   end
