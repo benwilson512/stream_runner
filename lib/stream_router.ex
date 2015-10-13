@@ -45,9 +45,41 @@ defmodule StreamRouter do
           {:noreply, stream_pid}
         end
       end
-
-    Obviously this doesn't really do anything.
   """
+
+  defmacro __using__(source) do
+    quote do
+      @source_key unquote(source)
+      @before_compile unquote(__MODULE__)
+
+      def handle_info({:"$gen_route", {pid, ref}, event}, state) do
+        result = handle_event(event, pid, state)
+        send(pid, {ref, :ok})
+        result
+      end
+    end
+  end
+
+  defmacro __before_compile__(_) do
+    quote [location: :keep] do
+
+      defimpl Collectable do
+        def into(%{pid: pid} = dest) do
+          send(pid, {:stream_up, self()})
+          {dest, &do_into/2}
+        end
+
+        def do_into(%{pid: pid} = dest, {:cont, value}) do
+          StreamRouter.route(pid, value)
+          dest
+        end
+        def do_into(%{pid: pid} = dest, done_or_halt) do
+          StreamRouter.eos(pid, done_or_halt)
+          dest
+        end
+      end
+    end
+  end
 
   ## StreamRouter API
   ###################
@@ -112,7 +144,10 @@ defmodule StreamRouter do
   end
 
   ## Starting StreamRouter
-  ########################
+  ## Everything from here until
+  ## the loop functions is exactly the same as
+  ## StreamRunner and should be refactored out
+  ############################################
 
   @typedoc "Debug option values."
   @type debug_option :: :trace | :log | :statistics | {:log_to_file, Path.t}
@@ -147,7 +182,7 @@ defmodule StreamRouter do
     start(stream, opts, :nolink)
   end
 
-  ## :gen callbacks
+  ## :gen callbacks common with
 
   @doc false
   def init_it(starter, :self, name, mod, args, opts) do
@@ -179,29 +214,32 @@ defmodule StreamRouter do
     end
   end
 
-  ## :sys callbacks
+  # :sys callbacks
 
   @doc false
-  def system_continue(parent, dbg, [name, cont, dest, demand]) do
+  def system_continue(parent, dbg, val) do
+    [name, cont, dest, demand] = val
     loop(parent, dbg, name, cont, dest, demand)
   end
 
   @doc false
-  def system_terminate(reason, _, dbg, [name, cont]) do
+  def system_terminate(reason, _, dbg, val) do
+    IO.puts "heyeee"
+    [name, cont, dest, demand] = val
     terminate(reason, dbg, name, cont)
   end
 
   @doc false
-  def system_code_change([name, cont], _, _, _), do: {:ok, [name, cont]}
+  def system_code_change(val, _, _, _), do: {:ok, val}
 
   @doc false
-  def system_get_state([_, cont]), do: {:ok, cont}
+  def system_get_state(state), do: {:ok, state}
 
   @doc false
-  def system_replace_state(replace, [name, cont]) do
+  def system_replace_state(replace, [name, cont, dest, demand]) do
     case replace.(cont) do
       cont when is_function(cont, 1) ->
-        {:ok, cont, [name, cont]}
+        {:ok, cont, [name, cont, dest, demand]}
      end
   end
 
@@ -253,77 +291,36 @@ defmodule StreamRouter do
     loop(parent, dbg, name, cont, %{}, 0)
   end
 
-  # TODO: store demand in an ordered structure
-  # Most of the time we're just concerned with the minimum demand anyway
-  def handle_demand(sinks, pid, :cancel) do
-    sinks = case Map.fetch(pid) do
-      {:ok, _} ->
-        Process.demonitor(pid, [:flush])
-        Map.delete(sinks, pid)
-      :error -> sinks
-    end
-    {sinks, determine_demand(sinks)}
-  end
+  ## Begin different loop
+  #######################
 
-  def handle_demand(sinks, pid, count) do
-    _ = Process.monitor(pid)
-    sinks = Map.put(sinks, pid, count)
-    {sinks, determine_demand(sinks)}
-  end
-
-  def supply_demand(sinks, count) do
-    sinks = sinks |> Enum.into(%{}, fn {k, v} -> {k, v - count} end)
-    {sinks, determine_demand(sinks)}
-  end
-
-  def determine_demand(sinks) do
-    {_, demand} = Enum.min_by(sinks, &elem(&1, 1))
-    demand
-  end
-
-  # Handle debug messages every loop
   defp loop(parent, dbg, name, cont, sinks, ag_demand) do
+    # If nothing has asked for events yet, wait until something does.
+    # Otherwise, immediately supply the demand
+    timeout = if ag_demand == 0, do: :infinity, else: 0
+
     receive do
+      # OTP Boilerplate
       {:EXIT, ^parent, reason} ->
         terminate(reason, dbg, name, cont)
       {:system, from, msg} ->
         :sys.handle_system_msg(msg, from, parent, __MODULE__, dbg, [name, cont, sinks, ag_demand])
-    after
-      0 -> handle_router_msgs(parent, dbg, name, cont, sinks, ag_demand)
-    end
-  end
-
-  # If nothing has asked for events yet, wait until something does.
-  # StreamRouter is only designed to listen to have one destination at this time.
-  defp handle_router_msgs(parent, dbg, name, cont, sinks, 0) do
-    receive do
+      # One of the monitored subscribers exited,
+      # remove all demand
       {:EXIT, pid, _} ->
         {sinks, ag_demand} = handle_demand(sinks, pid, :cancel)
         loop(parent, dbg, name, cont, sinks, ag_demand)
+      # Async demand
       {:"$gen_ask", {pid, nil}, {count, _}} ->
         {sinks, ag_demand} = handle_demand(sinks, pid, count)
         loop(parent, dbg, name, cont, sinks, ag_demand)
-      {:"$gen_ask", {pid, ref}, {count, _}} ->
-        {sinks, ag_demand} = handle_demand(sinks, pid, count)
-        send(pid, {ref, :ok})
-        loop(parent, dbg, name, cont, sinks, ag_demand)
-    end
-  end
-
-  defp handle_router_msgs(parent, dbg, name, cont, sinks, ag_demand) do
-    receive do
-      {:EXIT, pid, _} ->
-        {sinks, ag_demand} = handle_demand(sinks, pid, :cancel)
-        loop(parent, dbg, name, cont, sinks, ag_demand)
-      {:"$gen_ask", {pid, nil}, {count, _}} ->
-        {sinks, ag_demand} = handle_demand(sinks, pid, count)
-        loop(parent, dbg, name, cont, sinks, ag_demand)
+      # Sync demand Don't use at the moment
       {:"$gen_ask", {pid, ref}, {count, _}} ->
         {sinks, ag_demand} = handle_demand(sinks, pid, count)
         send(pid, {ref, :ok})
         loop(parent, dbg, name, cont, sinks, ag_demand)
     after
-      0 ->
+      timeout ->
         try do
           cont.({:cont, nil})
         catch
@@ -351,6 +348,45 @@ defmodule StreamRouter do
         end
     end
   end
+
+  ## StreamRouter Helpers
+  #######################
+
+  # TODO: store demand in an ordered structure
+  # Most of the time we're just concerned with the minimum demand anyway
+  @doc false
+  def handle_demand(sinks, pid, :cancel) do
+    sinks = case Map.fetch(pid) do
+      {:ok, _} ->
+        Process.demonitor(pid, [:flush])
+        Map.delete(sinks, pid)
+      :error -> sinks
+    end
+    {sinks, determine_demand(sinks)}
+  end
+
+  @doc false
+  def handle_demand(sinks, pid, count) do
+    _ = Process.monitor(pid)
+    sinks = Map.put(sinks, pid, count)
+    {sinks, determine_demand(sinks)}
+  end
+
+  @doc false
+  def supply_demand(sinks, count) do
+    sinks = sinks |> Enum.into(%{}, fn {k, v} -> {k, v - count} end)
+    {sinks, determine_demand(sinks)}
+  end
+
+  @doc false
+  def determine_demand(sinks) do
+    {_, demand} = Enum.min_by(sinks, &elem(&1, 1))
+    demand
+  end
+
+  ## Common with StreamRunner
+  ## TODO: Refactor common parts
+  ##############################
 
   defp print_event(device, {:suspended, v, cont}, name) do
     msg = ["*DBG* ", inspect(name), " got value ", inspect(v),
