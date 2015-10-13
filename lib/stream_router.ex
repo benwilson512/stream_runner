@@ -217,15 +217,12 @@ defmodule StreamRouter do
   # :sys callbacks
 
   @doc false
-  def system_continue(parent, dbg, val) do
-    [name, cont, dest, demand] = val
+  def system_continue(parent, dbg, [name, cont, dest, demand]) do
     loop(parent, dbg, name, cont, dest, demand)
   end
 
   @doc false
-  def system_terminate(reason, _, dbg, val) do
-    IO.puts "heyeee"
-    [name, cont, dest, demand] = val
+  def system_terminate(reason, _, dbg, [name, cont | _]) do
     terminate(reason, dbg, name, cont)
   end
 
@@ -244,7 +241,7 @@ defmodule StreamRouter do
   end
 
   @doc false
-  def format_status(:normal, [_, sys_state, parent, dbg, [name, cont]]) do
+  def format_status(:normal, [_, sys_state, parent, dbg, [name, cont, dest, demand]]) do
     header = :gen.format_status_header('Status for StreamRunner', name)
     log = :sys.get_debug(:log, dbg, [])
     [{:header, header},
