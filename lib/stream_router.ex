@@ -106,7 +106,7 @@ defmodule StreamRouter do
   Indicate demand for items
   """
   @spec ask(pid, integer, timeout) :: :ok | {:error, term}
-  def ask(source, quantity, timeout \\ 5000) do
+  def ask(source, quantity, timeout \\ 5000) when is_integer(quantity) do
     ref = Process.monitor(source)
     send(source, {:"$gen_ask", {self(), ref}, {quantity, []}})
     wait_for_reply(:ask, ref, source, quantity, timeout)
@@ -116,7 +116,7 @@ defmodule StreamRouter do
   Notify a sink that the stream is terminating
   """
   @spec ask_async(pid, integer) :: :ok
-  def ask_async(source, quantity) do
+  def ask_async(source, quantity) when is_integer(quantity) do
     send(source, {:"$gen_ask", {self(), nil}, {quantity, []}})
     :ok
   end
